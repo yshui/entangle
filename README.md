@@ -1,2 +1,2 @@
 # entangle
-Forward input devices over network
+Spooky input device action at a distance
