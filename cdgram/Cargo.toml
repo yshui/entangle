@@ -1,0 +1,28 @@
+[package]
+name = "cdgram"
+version = "0.1.0"
+authors = ["Yuxuan Shui <yshuiv7@gmail.com>"]
+edition = "2018"
+description = "Async encrypted datagram"
+
+[[bin]]
+name = "fuzz"
+required-features = [ "mock" ]
+
+[dependencies]
+sodiumoxide = "0.2"
+async-std = { version = "1", features = [ "unstable" ] }
+pin-project = "1"
+once_cell = "1"
+pin-utils = "0.1"
+futures = "0.3"
+either = "1"
+anyhow = "1"
+nix = "0"
+async-trait = "0.1"
+log = "0.4"
+env_logger = "0.8"
+base64 = "*"
+
+[features]
+mock = []

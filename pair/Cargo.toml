@@ -1,0 +1,18 @@
+[package]
+name = "pair"
+version = "0.1.0"
+authors = ["Yuxuan Shui <yshuiv7@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+argh = "0.1"
+sodiumoxide = "0.2"
+async-std = "1"
+toml = "0.5"
+serde = "1"
+serde_derive = "1"
+anyhow = "1"
+static_assertions = "1"
+byteorder = "1"
+termion = "1"
+config = { path = "../config" }

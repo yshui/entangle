@@ -1,0 +1,30 @@
+[package]
+name = "daemon"
+version = "0.1.0"
+authors = ["Yuxuan Shui <yshuiv7@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+cdgram = { path = "../cdgram" }
+argh = "0.1"
+async-std = "1"
+anyhow = "1"
+toml = "0.5"
+config = { path = "../config" }
+either = "1"
+futures = "0.3"
+fixedbitset = "0.3"
+serde = "1"
+serde_derive = "1"
+byteorder = "1"
+serde_bytes = "0.11"
+bincode = "1"
+udev = "0.5"
+ioctl-sys = "0.5"
+libc = "0.2"
+nix = "0.19"
+log = "0.4"
+env_logger = "0.8"
+bitflags = "1"
+num = "0.3"
+num_enum = "0.5"

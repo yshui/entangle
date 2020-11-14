@@ -1,0 +1,11 @@
+[package]
+name = "config"
+version = "0.1.0"
+authors = ["Yuxuan Shui <yshuiv7@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+serde = "1"
+serde_derive = "1"
+sodiumoxide = "0.2"
+base64 = "0.13"
