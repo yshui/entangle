@@ -5,22 +5,29 @@ use ::anyhow::Result;
 use ::async_std::net::{SocketAddr, UdpSocket};
 
 use crate::evdev;
+use ::async_std::sync::{Arc, Mutex};
 use ::cdgram::CDGramServer;
-use ::futures::future::{self, Either as FutEither};
-use ::log::{debug, trace};
+use ::log::{debug, info, trace};
 
+#[derive(Clone)]
 enum Event {
     ClientPacket(ClientMessage),
     InputEvent((u32, ::libc::input_event)),
     RemoveDevice(u32),
     NewDevice((u32, InputDevice)),
+}
+
+enum ControlEvent {
+    Event(Event),
     MonitorNewDevice(evdev::Device),
     MonitorError(anyhow::Error),
+    Timeout(SocketAddr),
 }
 
 struct ClientStates {
     synced_devices: HashSet<u32>,
     addr: SocketAddr,
+    timeout: Option<async_std::task::JoinHandle<()>>,
 }
 impl ClientStates {
     fn handle_event(
@@ -65,7 +72,7 @@ impl ClientStates {
                         .entry(*id)
                         .or_insert_with(|| crate::proto::InputDeviceUpdate::Update(dev.clone()));
                 }
-                self.synced_devices = devices.keys().map(|x| *x).collect();
+                self.synced_devices = devices.keys().copied().collect();
                 Some(ServerMessage::Sync(updates))
             }
             Event::RemoveDevice(dev_id) => {
@@ -104,21 +111,28 @@ impl ClientStates {
                     )))
                 }
             }
-            _ => panic!(),
         }
     }
 }
 
-fn start_device(id: u32, mut dev: evdev::Device, device_tx: ::async_std::sync::Sender<Event>) {
+fn start_device(
+    id: u32,
+    mut dev: evdev::Device,
+    device_tx: ::async_std::sync::Sender<ControlEvent>,
+) {
     ::async_std::task::spawn(async move {
         while let Ok(event) = dev.next_event().await {
-            device_tx.send(Event::InputEvent((id as u32, event))).await;
+            device_tx
+                .send(ControlEvent::Event(Event::InputEvent((id as u32, event))))
+                .await;
         }
-        device_tx.send(Event::RemoveDevice(id as u32)).await;
+        device_tx
+            .send(ControlEvent::Event(Event::RemoveDevice(id as u32)))
+            .await;
     });
 }
 
-fn monitor_devices(device_tx: ::async_std::sync::Sender<Event>) -> Result<!> {
+fn monitor_devices(device_tx: ::async_std::sync::Sender<ControlEvent>) -> Result<!> {
     use ::anyhow::anyhow;
     use ::std::os::unix::io::AsRawFd;
     use ::udev::MonitorBuilder;
@@ -139,7 +153,7 @@ fn monitor_devices(device_tx: ::async_std::sync::Sender<Event>) -> Result<!> {
                 let path = path.to_owned();
                 ::async_std::task::spawn(async move {
                     let dev = evdev::Device::open(&path).await?;
-                    device_tx.send(Event::MonitorNewDevice(dev)).await;
+                    device_tx.send(ControlEvent::MonitorNewDevice(dev)).await;
                     Result::<_, ::anyhow::Error>::Ok(())
                 });
             }
@@ -150,7 +164,12 @@ fn monitor_devices(device_tx: ::async_std::sync::Sender<Event>) -> Result<!> {
 
 fn get_device_state((id, dev): (u32, &evdev::Device)) -> Result<(u32, InputDevice)> {
     //dev.relative_axes_supported().
-    debug!("Got evdev device {:?} rel {} cap {}", dev, dev.relative_axes_supported().bits(), dev.events_supported().bits());
+    debug!(
+        "Got evdev device {:?} rel {} cap {}",
+        dev,
+        dev.relative_axes_supported().bits(),
+        dev.events_supported().bits()
+    );
     let input_id = dev.input_id();
     let state = InputDevice {
         name: dev.name().to_str()?.to_owned(),
@@ -167,18 +186,18 @@ fn get_device_state((id, dev): (u32, &evdev::Device)) -> Result<(u32, InputDevic
 
 pub(crate) async fn run(global_cfg: ::config::Config, _: super::EntangledServerOpts) -> Result<!> {
     let socket = UdpSocket::bind(("0.0.0.0", 3241)).await?;
-    let mut server = CDGramServer::new(
+    let server = Arc::new(Mutex::new(CDGramServer::new(
         global_cfg.public(),
         global_cfg.secret(),
         global_cfg.peers.iter().map(|p| p.public()),
         socket,
-    );
+    )));
 
-    let mut active_clients = HashMap::new();
+    let active_clients = Arc::new(Mutex::new(HashMap::new()));
     let (device_tx, device_rx) = ::async_std::sync::channel(1024);
     // This function starts a new thread to handle the events from a device.
     // Received events will be sent through device_tx
-    let mut devices: HashMap<_, _> = evdev::enumerate()
+    let devices: HashMap<_, _> = evdev::enumerate()
         .await?
         .into_iter()
         .enumerate()
@@ -190,51 +209,107 @@ pub(crate) async fn run(global_cfg: ::config::Config, _: super::EntangledServerO
         })
         .collect::<Result<HashMap<_, _>>>()?;
 
+    // Lock order, active_clients > devices
+    let devices = Arc::new(Mutex::new(devices));
+    let devices2 = devices.clone();
+
     let device_tx2 = device_tx.clone();
     ::std::thread::spawn(move || {
         let Err(e) = monitor_devices(device_tx2.clone());
-        ::async_std::task::block_on(device_tx2.send(Event::MonitorError(e)));
+        ::async_std::task::block_on(device_tx2.send(ControlEvent::MonitorError(e)));
     });
 
-    loop {
-        let (g, event) =
-            match future::select(Box::pin(server.recv()), Box::pin(device_rx.recv())).await {
-                FutEither::Left((msg, _)) => {
-                    let (addr, pkt) = msg?;
-                    let g = active_clients.entry(addr).or_insert_with(|| ClientStates {
-                        synced_devices: HashSet::new(),
-                        addr,
-                    });
-                    let pkt = ::bincode::deserialize(&pkt)?;
-                    debug!("Got client packet {:?}", pkt);
-                    (Some((g, addr)), Event::ClientPacket(pkt))
-                }
-                FutEither::Right((Ok(Event::RemoveDevice(id)), _)) => {
-                    debug!("Device {} has died", id);
-                    devices.remove(&id).unwrap();
-                    (None, Event::RemoveDevice(id))
-                }
-                FutEither::Right((Ok(Event::MonitorNewDevice(dev)), _)) => {
-                    let dev_id = devices.len();
-                    let (dev_id, state) = get_device_state((dev_id as u32, &dev))?;
-                    devices.insert(dev_id, state.clone()).unwrap_none();
-                    start_device(dev_id, dev, device_tx.clone());
-                    (None, Event::NewDevice((dev_id as u32, state)))
-                }
-                FutEither::Right((Ok(Event::MonitorError(e)), _)) => return Err(e.into()),
-                FutEither::Right((Ok(e), _)) => (None, e),
-                FutEither::Right((Err(e), _)) => return Err(e.into()),
-            };
+    let active_clients2 = active_clients.clone();
+    let server2 = server.clone();
+    let device_tx3 = device_tx.clone();
+    let _: async_std::task::JoinHandle<Result<!>> = async_std::task::spawn(async move {
+        loop {
+            let msg = server.lock().await.recv().await;
+            let (addr, pkt) = msg?;
+            let pkt = ::bincode::deserialize(&pkt)?;
 
-        if let Some((g, addr)) = g {
-            if let Some(reply) = g.handle_event(&event, &devices) {
-                server.send(addr, &::bincode::serialize(&reply)?).await?;
-            }
-        } else {
-            for (addr, g) in active_clients.iter_mut() {
-                if let Some(reply) = g.handle_event(&event, &devices) {
-                    server.send(addr, &::bincode::serialize(&reply)?).await?;
+            let mut active_clients = active_clients2.lock().await;
+            let g = active_clients.entry(addr).or_insert_with(|| ClientStates {
+                synced_devices: HashSet::new(),
+                addr,
+                timeout: None,
+            });
+            debug!("Got client packet {:?}", pkt);
+            if let Some(reply) = g.handle_event(&Event::ClientPacket(pkt), &*devices.lock().await) {
+                server
+                    .lock()
+                    .await
+                    .send(&addr, &::bincode::serialize(&reply)?)
+                    .await
+                    .map(|_| ())
+                    .unwrap_or_else(|e| {
+                        info!("Error: {}", e);
+                    });
+                if let Some(old_timeout) = g.timeout.take() {
+                    old_timeout.cancel().await;
                 }
+                let device_tx3 = device_tx3.clone();
+                g.timeout = Some(async_std::task::spawn(async move {
+                    async_std::task::sleep(std::time::Duration::from_secs(10)).await;
+                    device_tx3.send(ControlEvent::Timeout(addr)).await;
+                }))
+            }
+        }
+    });
+    loop {
+        let ctrl_msg = device_rx.recv().await?;
+        let event = match ctrl_msg {
+            ControlEvent::Event(Event::RemoveDevice(id)) => {
+                debug!("Device {} has died", id);
+                // FIXME
+                devices2.lock().await.remove(&id).unwrap();
+                Event::RemoveDevice(id)
+            }
+            ControlEvent::MonitorNewDevice(dev) => {
+                let dev_id = devices2.lock().await.len();
+                let (dev_id, state) = get_device_state((dev_id as u32, &dev))?;
+                devices2
+                    .lock()
+                    .await
+                    .insert(dev_id, state.clone())
+                    .unwrap_none();
+                start_device(dev_id, dev, device_tx.clone());
+                Event::NewDevice((dev_id as u32, state))
+            }
+            ControlEvent::MonitorError(e) => return Err(e),
+            ControlEvent::Event(e) => e,
+            ControlEvent::Timeout(addr) => {
+                // Remove the timed-out task
+                info!("Connection to {} has timed out", addr);
+                server2.lock().await.close(addr).await.unwrap();
+                let mut g = active_clients.lock().await.remove(&addr).unwrap();
+                // Note: g.timeout is not necessarily the timeout task that sent us this Timeout
+                // message. It could be: timeout -> new message sent -> new timeout task replaced
+                // the old one -> we receive the Timeout message. In this case the new timeout
+                // might still fire, so we need to cancel it.
+                g.timeout.take().unwrap().cancel().await;
+                continue;
+            }
+        };
+
+        for (addr, g) in active_clients.lock().await.iter_mut() {
+            if let Some(reply) = g.handle_event(&event, &*devices2.lock().await) {
+                server2
+                    .lock()
+                    .await
+                    .send(addr, &::bincode::serialize(&reply)?)
+                    .await
+                    .map(|_| ())
+                    .unwrap_or_else(|e| info!("Error: {}", e));
+                if let Some(old_timeout) = g.timeout.take() {
+                    old_timeout.cancel().await;
+                }
+                let device_tx = device_tx.clone();
+                let addr = *addr;
+                g.timeout = Some(async_std::task::spawn(async move {
+                    async_std::task::sleep(std::time::Duration::from_secs(10)).await;
+                    device_tx.send(ControlEvent::Timeout(addr)).await;
+                }))
             }
         }
     }

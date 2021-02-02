@@ -1,7 +1,7 @@
 use ::serde_derive::{Deserialize, Serialize};
 use ::std::collections::HashMap;
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum ClientMessage {
     /// Sychronize the list of input devices and their states.
     /// Client sends a list of input devices it knows about, and then
