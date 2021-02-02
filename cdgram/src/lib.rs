@@ -241,6 +241,18 @@ impl<T: Socket> CDGramServer<T> {
             }
         }
     }
+
+    pub async fn close(&mut self, addr: impl ToSocketAddrs) -> Result<bool> {
+        Ok(self
+            .auth_states
+            .remove(
+                &addr.to_socket_addrs()
+                    .await?
+                    .next()
+                    .with_context(|| "Failed to resolve address".to_owned())?,
+            )
+            .is_some())
+    }
 }
 
 pub struct CDGramClient<T> {
