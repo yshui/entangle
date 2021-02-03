@@ -4,6 +4,7 @@ use ::std::path::{Path, PathBuf};
 
 use ::argh::FromArgs;
 use ::async_std::net::IpAddr;
+use log::info;
 
 /// Entangled subcommands
 #[derive(FromArgs, PartialEq, Debug)]
@@ -42,10 +43,10 @@ struct EntangledOpts {
 }
 
 mod client;
+mod evdev;
 mod proto;
 mod server;
 mod uinput;
-mod evdev;
 
 fn main() -> Result<()> {
     ::env_logger::init();
@@ -54,6 +55,19 @@ fn main() -> Result<()> {
     use EntangledSubcommands::*;
     match opts.subcommand {
         Server(server) => ::async_std::task::block_on(server::run(cfg, server))?,
-        Client(client) => ::async_std::task::block_on(client::run(cfg, client))?,
+        Client(client) => {
+            use ::governor::{Quota, RateLimiter};
+            use std::convert::TryInto;
+            let rl = RateLimiter::direct(
+                Quota::per_second(1u32.try_into().unwrap()).allow_burst(5u32.try_into().unwrap()),
+            );
+            ::async_std::task::block_on(async move {
+                loop {
+                    rl.until_ready().await;
+                    let Err(e) = client::run(&cfg, &client).await;
+                    info!("Restarting client because of error {}", e);
+                }
+            })
+        }
     }
 }

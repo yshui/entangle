@@ -147,8 +147,8 @@ async fn handle_packet(
 }
 
 pub(crate) async fn run(
-    global_cfg: ::config::Config,
-    cfg: super::EntangledClientOpts,
+    global_cfg: &::config::Config,
+    cfg: &super::EntangledClientOpts,
 ) -> Result<!> {
     use ::async_std::future::timeout;
     let socket = UdpSocket::bind(("0.0.0.0", 0)).await?;
