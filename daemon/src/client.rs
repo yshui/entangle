@@ -166,15 +166,22 @@ pub(crate) async fn run(
     let mut devices = HashMap::<u32, InputDeviceState>::new();
 
     let mut client = CDGramClient::new(global_cfg.public(), global_cfg.secret(), server_pk, socket);
-    client.connect(server_addr).await?;
-    client
-        .send(&::bincode::serialize(&ClientMessage::Sync(HashMap::new()))?)
-        .await?;
+    timeout(std::time::Duration::from_secs(1), async {
+        client.connect(server_addr).await?;
+        client
+            .send(&::bincode::serialize(&ClientMessage::Sync(HashMap::new()))?)
+            .await
+    })
+    .await.with_context(|| "Timed out establishing connection".to_owned())??;
     let client = Arc::new(client);
     let mut keepalive: Option<async_std::task::JoinHandle<()>> = None;
     let mut pong_pending = false;
     loop {
-        let pkt = timeout(std::time::Duration::from_millis(if pong_pending { 200 } else { 1000 }), client.recv()).await;
+        let pkt = timeout(
+            std::time::Duration::from_millis(if pong_pending { 200 } else { 1000 }),
+            client.recv(),
+        )
+        .await;
         if let Ok(pkt) = pkt {
             let pkt = pkt?;
             if let Some(h) = keepalive.take() {
@@ -201,7 +208,9 @@ pub(crate) async fn run(
             }
             debug!("Server idle detected");
             pong_pending = true;
-            client.send(&::bincode::serialize(&ClientMessage::Ping)?).await?;
+            client
+                .send(&::bincode::serialize(&ClientMessage::Ping)?)
+                .await?;
         }
     }
 }
