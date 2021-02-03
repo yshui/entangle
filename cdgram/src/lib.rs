@@ -1,6 +1,7 @@
 pub mod generator;
 use ::anyhow::{anyhow, Context, Result};
 use ::async_std::net::{self, SocketAddr, ToSocketAddrs};
+use ::async_std::sync::RwLock;
 use ::log::*;
 use ::sodiumoxide::crypto::{
     aead,
@@ -13,17 +14,17 @@ use generator::{Generator, GeneratorState, Turnable};
 
 #[async_trait::async_trait]
 pub trait Socket {
-    async fn recv(&mut self) -> Result<(SocketAddr, Vec<u8>)>;
+    async fn recv(&self) -> Result<(SocketAddr, Vec<u8>)>;
     async fn connect(
-        &mut self,
+        &self,
         addr: impl ToSocketAddrs<Iter = impl Iterator<Item = SocketAddr> + Send + 'static>
             + Send
             + Sync
             + 'static,
     ) -> Result<()>;
-    async fn send(&mut self, buf: &[u8]) -> Result<usize>;
+    async fn send(&self, buf: &[u8]) -> Result<usize>;
     async fn send_to(
-        &mut self,
+        &self,
         buf: &[u8],
         addr: impl ToSocketAddrs<Iter = impl Iterator<Item = SocketAddr> + Send + 'static>
             + Send
@@ -34,7 +35,7 @@ pub trait Socket {
 
 #[async_trait::async_trait]
 impl Socket for net::UdpSocket {
-    async fn recv(&mut self) -> Result<(SocketAddr, Vec<u8>)> {
+    async fn recv(&self) -> Result<(SocketAddr, Vec<u8>)> {
         use ::nix::sys::socket::{recvmsg, MsgFlags};
         use ::std::os::unix::io::AsRawFd;
         let _ = self.peek(&mut []).await?;
@@ -50,7 +51,7 @@ impl Socket for net::UdpSocket {
         Ok((addr, buf))
     }
     async fn connect(
-        &mut self,
+        &self,
         addr: impl ToSocketAddrs<Iter = impl Iterator<Item = SocketAddr> + Send + 'static>
             + Send
             + Sync
@@ -59,7 +60,7 @@ impl Socket for net::UdpSocket {
         Ok(net::UdpSocket::connect(self, addr).await?)
     }
     async fn send_to(
-        &mut self,
+        &self,
         buf: &[u8],
         addr: impl ToSocketAddrs<Iter = impl Iterator<Item = SocketAddr> + Send + 'static>
             + Send
@@ -69,7 +70,7 @@ impl Socket for net::UdpSocket {
         Ok(net::UdpSocket::send_to(self, buf, addr).await?)
     }
 
-    async fn send(&mut self, buf: &[u8]) -> Result<usize> {
+    async fn send(&self, buf: &[u8]) -> Result<usize> {
         Ok(net::UdpSocket::send(self, buf).await?)
     }
 }
@@ -90,7 +91,7 @@ pub struct CDGramServer<T> {
     secret: SecretKey,
     authorized_keys: HashSet<PublicKey>,
     socket: T,
-    auth_states: HashMap<SocketAddr, AuthState>,
+    auth_states: RwLock<HashMap<SocketAddr, AuthState>>,
 }
 
 impl<T: 'static> CDGramServer<T> {
@@ -158,14 +159,15 @@ async fn handshake(
         .map_err(|()| anyhow!("Failed to generate session keys"))
 }
 impl<T: Socket> CDGramServer<T> {
-    pub async fn recv(&mut self) -> Result<(SocketAddr, Vec<u8>)> {
+    pub async fn recv(&self) -> Result<(SocketAddr, Vec<u8>)> {
         loop {
             let (addr, buf) = self.socket.recv().await?;
 
             use ::either::Either;
             // Find session key
             let our_sk = self.secret.clone();
-            let auth_state = self.auth_states.entry(addr);
+            let mut auth_states = self.auth_states.write().await;
+            let auth_state = auth_states.entry(addr);
 
             if let Entry::Vacant(_) = auth_state {
                 info!("New connection from {}", addr);
@@ -201,7 +203,7 @@ impl<T: Socket> CDGramServer<T> {
                     }
                     Either::Right(Err(e)) => {
                         error!("Handshake error with {}: {}", addr, e);
-                        self.auth_states.remove(&addr);
+                        auth_states.remove(&addr);
                     }
                 },
                 AuthState::Completed((rx, _)) => {
@@ -214,39 +216,47 @@ impl<T: Socket> CDGramServer<T> {
         }
     }
 
-    pub async fn send(&mut self, addr: impl ToSocketAddrs, buf: &[u8]) -> Result<usize> {
+    pub async fn send(&self, addr: impl ToSocketAddrs, buf: &[u8]) -> Result<usize> {
         let addr = addr
             .to_socket_addrs()
             .await?
             .next()
             .with_context(|| "Failed to resolve address".to_owned())?;
-        let auth_state = self
-            .auth_states
-            .get(&addr)
-            .with_context(|| format!("Trying to send to unknown client {}", addr))?;
+        let send = {
+            let auth_states = self.auth_states.read().await;
+            let auth_state = auth_states
+                .get(&addr)
+                .with_context(|| format!("Trying to send to unknown client {}", addr))?;
+            match auth_state {
+                AuthState::Completed((_, tx)) => {
+                    let nonce = aead::gen_nonce();
+                    let c = aead::seal(buf, None, &nonce, &tx);
+                    let mut send = nonce.as_ref().to_vec();
+                    send.extend(c.as_slice());
+                    send
+                }
+                AuthState::Initiated(_) => {
+                    return Err(anyhow!(
+                        "Trying to send to a client {} in the middle of handshake",
+                        addr
+                    ))
+                }
+            }
+        };
         debug!("Sending packet to {}", addr);
-        match auth_state {
-            AuthState::Completed((_, tx)) => {
-                let nonce = aead::gen_nonce();
-                let c = aead::seal(buf, None, &nonce, &tx);
-                let mut send = nonce.as_ref().to_vec();
-                send.extend(c.as_slice());
-                Ok(self.socket.send_to(send.as_slice(), addr).await?)
-            }
-            AuthState::Initiated(_) => {
-                return Err(anyhow!(
-                    "Trying to send to a client {} in the middle of handshake",
-                    addr
-                ))
-            }
-        }
+        let ret = self.socket.send_to(send.as_slice(), addr).await?;
+        debug!("Packet sent");
+        Ok(ret)
     }
 
-    pub async fn close(&mut self, addr: impl ToSocketAddrs) -> Result<bool> {
+    pub async fn close(&self, addr: impl ToSocketAddrs) -> Result<bool> {
         Ok(self
             .auth_states
+            .write()
+            .await
             .remove(
-                &addr.to_socket_addrs()
+                &addr
+                    .to_socket_addrs()
                     .await?
                     .next()
                     .with_context(|| "Failed to resolve address".to_owned())?,
@@ -329,7 +339,7 @@ impl<T: Socket> CDGramClient<T> {
         Ok(())
     }
 
-    pub async fn send(&mut self, buf: &[u8]) -> Result<usize> {
+    pub async fn send(&self, buf: &[u8]) -> Result<usize> {
         if let Some((_, tx)) = self.session_keys.as_ref() {
             let nonce = aead::gen_nonce();
             let c = aead::seal(buf, None, &nonce, &tx);
@@ -341,7 +351,7 @@ impl<T: Socket> CDGramClient<T> {
         }
     }
 
-    pub async fn recv(&mut self) -> Result<Vec<u8>> {
+    pub async fn recv(&self) -> Result<Vec<u8>> {
         if let Some((rx, _)) = self.session_keys.as_ref() {
             let (_, pkt) = self.socket.recv().await?;
             let nonce = aead::Nonce::from_slice(&pkt[0..aead::NONCEBYTES]).unwrap();
