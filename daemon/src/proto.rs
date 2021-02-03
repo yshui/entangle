@@ -8,6 +8,7 @@ pub enum ClientMessage {
     /// updates its list based on the InputDeviceUpdate reply from the server
     Sync(HashMap<u32, InputDevice>),
     KeepAlive,
+    Ping,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -16,6 +17,7 @@ pub enum ServerMessage {
     Sync(HashMap<u32, InputDeviceUpdate>),
     /// Input event
     Event((u32, InputEvent)),
+    Pong,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

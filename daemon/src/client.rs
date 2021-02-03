@@ -76,10 +76,81 @@ impl Drop for InputDeviceState {
     }
 }
 
+async fn handle_packet(
+    pkt: ServerMessage,
+    devices: &mut HashMap<u32, InputDeviceState>,
+) -> Result<()> {
+    use ::futures::AsyncWriteExt;
+    match pkt {
+        ServerMessage::Sync(devs) => {
+            for (id, update) in devs {
+                use crate::proto::InputDeviceUpdate::*;
+                match update {
+                    Update(state) => {
+                        if let Some(old_device) = devices.get(&id) {
+                            if old_device.state.cap != state.cap
+                                || old_device.state.key_bits != state.key_bits
+                                || old_device.state.rel_bits != state.rel_bits
+                                || old_device.state.name != state.name
+                                || old_device.state.vendor != state.vendor
+                                || old_device.state.product != state.product
+                                || old_device.state.version != state.version
+                            {
+                                // Recreate the device
+                                devices.remove(&id);
+                                devices.insert(id, InputDeviceState::create(state)?);
+                            } else {
+                                // Sychronize the key_vals
+                            }
+                        } else {
+                            debug!("Got new input device {}:{:?}", id, state);
+                            devices.insert(id, InputDeviceState::create(state)?);
+                        }
+                    }
+                    Drop => {
+                        devices.remove(&id);
+                    }
+                }
+            }
+        }
+        ServerMessage::Event((dev_id, ev)) => {
+            debug!("Received event for {}, {:?}", dev_id, ev);
+            if let Some(state) = devices.get_mut(&dev_id) {
+                let ev = ::libc::input_event {
+                    time: ::libc::timeval {
+                        tv_sec: 0,
+                        tv_usec: 0,
+                    },
+                    type_: ev.type_,
+                    code: ev.code,
+                    value: ev.value,
+                };
+                debug!("Writing device event {:?}", ev);
+                let data = unsafe {
+                    ::std::slice::from_raw_parts(
+                        &ev as *const _ as *const _,
+                        ::std::mem::size_of_val(&ev),
+                    )
+                };
+                state.dev_file.write(data).await?;
+                if (ev.type_ as u32) == crate::evdev::Types::SYNCHRONIZATION.bits().trailing_zeros()
+                {
+                    debug!("Flushing {:?}", ev);
+                    state.dev_file.flush().await?;
+                }
+                debug!("Write done {:?}", ev);
+            }
+        }
+        ServerMessage::Pong => {}
+    };
+    Ok(())
+}
+
 pub(crate) async fn run(
     global_cfg: ::config::Config,
     cfg: super::EntangledClientOpts,
 ) -> Result<!> {
+    use ::async_std::future::timeout;
     let socket = UdpSocket::bind(("0.0.0.0", 0)).await?;
 
     let mut server = None;
@@ -101,84 +172,36 @@ pub(crate) async fn run(
         .await?;
     let client = Arc::new(client);
     let mut keepalive: Option<async_std::task::JoinHandle<()>> = None;
+    let mut pong_pending = false;
     loop {
-        use ::futures::AsyncWriteExt;
-        let pkt = client.recv().await?;
-        if let Some(h) = keepalive.take() {
-            h.cancel().await;
-        }
-        let client2 = client.clone();
-        keepalive = Some(async_std::task::spawn(async move {
-            // Send keepalive message
-            async_std::task::sleep(std::time::Duration::from_millis(50)).await;
-            client2
-                .send(&::bincode::serialize(&ClientMessage::KeepAlive).unwrap())
-                .await
-                .map(|_| ())
-                .unwrap_or_else(|e| info!("Failed to send keep alive {}", e));
-        }));
-        let pkt: ServerMessage = ::bincode::deserialize(&pkt)?;
-        match pkt {
-            ServerMessage::Sync(devs) => {
-                for (id, update) in devs {
-                    use crate::proto::InputDeviceUpdate::*;
-                    match update {
-                        Update(state) => {
-                            if let Some(old_device) = devices.get(&id) {
-                                if old_device.state.cap != state.cap
-                                    || old_device.state.key_bits != state.key_bits
-                                    || old_device.state.rel_bits != state.rel_bits
-                                    || old_device.state.name != state.name
-                                    || old_device.state.vendor != state.vendor
-                                    || old_device.state.product != state.product
-                                    || old_device.state.version != state.version
-                                {
-                                    // Recreate the device
-                                    devices.remove(&id);
-                                    devices.insert(id, InputDeviceState::create(state)?);
-                                } else {
-                                    // Sychronize the key_vals
-                                }
-                            } else {
-                                debug!("Got new input device {}:{:?}", id, state);
-                                devices.insert(id, InputDeviceState::create(state)?);
-                            }
-                        }
-                        Drop => {
-                            devices.remove(&id);
-                        }
-                    }
-                }
+        let pkt = timeout(std::time::Duration::from_millis(if pong_pending { 200 } else { 1000 }), client.recv()).await;
+        if let Ok(pkt) = pkt {
+            let pkt = pkt?;
+            if let Some(h) = keepalive.take() {
+                h.cancel().await;
             }
-            ServerMessage::Event((dev_id, ev)) => {
-                debug!("Received event for {}, {:?}", dev_id, ev);
-                if let Some(state) = devices.get_mut(&dev_id) {
-                    let ev = ::libc::input_event {
-                        time: ::libc::timeval {
-                            tv_sec: 0,
-                            tv_usec: 0,
-                        },
-                        type_: ev.type_,
-                        code: ev.code,
-                        value: ev.value,
-                    };
-                    debug!("Writing device event {:?}", ev);
-                    let data = unsafe {
-                        ::std::slice::from_raw_parts(
-                            &ev as *const _ as *const _,
-                            ::std::mem::size_of_val(&ev),
-                        )
-                    };
-                    state.dev_file.write(data).await?;
-                    if (ev.type_ as u32)
-                        == crate::evdev::Types::SYNCHRONIZATION.bits().trailing_zeros()
-                    {
-                        debug!("Flushing {:?}", ev);
-                        state.dev_file.flush().await?;
-                    }
-                    debug!("Write done {:?}", ev);
-                }
+            let client2 = client.clone();
+            keepalive = Some(async_std::task::spawn(async move {
+                // Send keepalive message
+                async_std::task::sleep(std::time::Duration::from_millis(50)).await;
+                client2
+                    .send(&::bincode::serialize(&ClientMessage::KeepAlive).unwrap())
+                    .await
+                    .map(|_| ())
+                    .unwrap_or_else(|e| info!("Failed to send keep alive {}", e));
+            }));
+            let pkt: ServerMessage = ::bincode::deserialize(&pkt)?;
+            handle_packet(pkt, &mut devices).await?;
+            pong_pending = false;
+        } else {
+            // Timeout receiving
+            if pong_pending {
+                // Connection has timed out
+                return Err(anyhow!("Connection timed out"));
             }
+            debug!("Server idle detected");
+            pong_pending = true;
+            client.send(&::bincode::serialize(&ClientMessage::Ping)?).await?;
         }
     }
 }

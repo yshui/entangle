@@ -36,6 +36,11 @@ impl ClientStates {
         event: &Event,
         devices: &HashMap<u32, InputDevice>,
     ) -> Option<ServerMessage> {
+        if let Event::ClientPacket(_) = event {
+            if let Some(h) = self.timeout.take() {
+                h.cancel().await;
+            }
+        }
         match event {
             Event::ClientPacket(ClientMessage::Sync(devs)) => {
                 let mut updates = HashMap::new();
@@ -75,14 +80,12 @@ impl ClientStates {
                 }
                 self.synced_devices = devices.keys().copied().collect();
                 Some(ServerMessage::Sync(updates))
-            },
+            }
             Event::ClientPacket(ClientMessage::KeepAlive) => {
                 debug!("Got keep alive from client {}", self.addr);
-                if let Some(h) = self.timeout.take() {
-                    h.cancel().await;
-                };
                 None
             }
+            Event::ClientPacket(ClientMessage::Ping) => Some(ServerMessage::Pong),
             Event::RemoveDevice(dev_id) => {
                 debug!("Telling client {} to drop {}", self.addr, dev_id);
                 use ::std::iter::once;
@@ -250,7 +253,10 @@ pub(crate) async fn run(global_cfg: ::config::Config, _: super::EntangledServerO
                 timeout: None,
             });
             debug!("Got client packet {:?}", pkt);
-            if let Some(reply) = g.handle_event(&Event::ClientPacket(pkt), &*devices.lock().await).await {
+            if let Some(reply) = g
+                .handle_event(&Event::ClientPacket(pkt), &*devices.lock().await)
+                .await
+            {
                 if server
                     .send(&addr, &::bincode::serialize(&reply)?)
                     .await
@@ -265,7 +271,7 @@ pub(crate) async fn run(global_cfg: ::config::Config, _: super::EntangledServerO
                     }
                     let device_tx3 = device_tx3.clone();
                     g.timeout = Some(async_std::task::spawn(async move {
-                        async_std::task::sleep(std::time::Duration::from_secs(10)).await;
+                        async_std::task::sleep(std::time::Duration::from_millis(200)).await;
                         device_tx3.send(ControlEvent::Timeout(addr)).await.unwrap();
                     }))
                 }
