@@ -7,6 +7,7 @@ pub enum ClientMessage {
     /// Client sends a list of input devices it knows about, and then
     /// updates its list based on the InputDeviceUpdate reply from the server
     Sync(HashMap<u32, InputDevice>),
+    KeepAlive,
 }
 
 #[derive(Serialize, Deserialize)]

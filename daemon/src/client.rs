@@ -3,10 +3,10 @@ use ::std::collections::HashMap;
 use crate::proto::ClientMessage;
 use crate::uinput;
 use ::anyhow::{anyhow, Context, Result};
-use ::async_std::{fs, net::UdpSocket};
+use ::async_std::{fs, net::UdpSocket, sync::Arc};
 use ::cdgram::CDGramClient;
 use ::std::mem::ManuallyDrop;
-use log::debug;
+use log::{debug, info};
 
 use crate::proto::ServerMessage;
 struct InputDeviceState {
@@ -99,9 +99,24 @@ pub(crate) async fn run(
     client
         .send(&::bincode::serialize(&ClientMessage::Sync(HashMap::new()))?)
         .await?;
+    let client = Arc::new(client);
+    let mut keepalive: Option<async_std::task::JoinHandle<()>> = None;
     loop {
         use ::futures::AsyncWriteExt;
         let pkt = client.recv().await?;
+        if let Some(h) = keepalive.take() {
+            h.cancel().await;
+        }
+        let client2 = client.clone();
+        keepalive = Some(async_std::task::spawn(async move {
+            // Send keepalive message
+            async_std::task::sleep(std::time::Duration::from_millis(50)).await;
+            client2
+                .send(&::bincode::serialize(&ClientMessage::KeepAlive).unwrap())
+                .await
+                .map(|_| ())
+                .unwrap_or_else(|e| info!("Failed to send keep alive {}", e));
+        }));
         let pkt: ServerMessage = ::bincode::deserialize(&pkt)?;
         match pkt {
             ServerMessage::Sync(devs) => {
@@ -155,7 +170,9 @@ pub(crate) async fn run(
                         )
                     };
                     state.dev_file.write(data).await?;
-                    if (ev.type_ as u32) == crate::evdev::Types::SYNCHRONIZATION.bits().trailing_zeros() {
+                    if (ev.type_ as u32)
+                        == crate::evdev::Types::SYNCHRONIZATION.bits().trailing_zeros()
+                    {
                         debug!("Flushing {:?}", ev);
                         state.dev_file.flush().await?;
                     }
